@@ -59,7 +59,7 @@ function mark_bindings!(x::EXPR, state)
             mark_sig_args!(x.args[1])
         elseif CSTParser.iscurly(x.args[1])
             mark_typealias_bindings!(x)
-        elseif !is_getfield(x.args[1])
+        elseif !is_getfield(x.args[1]) && state.flags & NO_NEW_BINDINGS == 0
             mark_binding!(x.args[1], x)
         end
     elseif CSTParser.defines_anon_function(x)
@@ -100,10 +100,9 @@ function mark_bindings!(x::EXPR, state)
         end
         mark_parameters(CSTParser.get_sig(x))
         if CSTParser.defines_struct(x) # mark field block
-            for i in 1:length(x.args[3].args)
-                CSTParser.defines_function(x.args[3].args[i]) && continue
-                arg = x.args[3].args[i]
-                if kwdef && CSTParser.isassignment(arg)
+            for arg in x.args[3].args
+                CSTParser.defines_function(arg) && continue
+                if kwdef && CSTParser.isassignment(arg) || arg.head === :const
                     arg = arg.args[1]
                 end
                 mark_binding!(arg)

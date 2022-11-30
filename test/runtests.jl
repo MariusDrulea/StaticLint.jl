@@ -155,6 +155,17 @@ function f(arg::T)
 end
 """) == [true, true, true, true, true, true, true]
 
+        if VERSION > v"1.8-"
+            @test check_resolved("""
+            mutable struct T
+                const field
+            end
+            function f(arg::T)
+                arg.field
+            end
+            """) == [true, true, true, true, true, true, true]
+        end
+
         @test check_resolved("""
 f(arg) = arg
 """) == [1, 1, 1]
@@ -300,8 +311,11 @@ f(arg) = arg
                 @test errorof(cst[4][2][3]) === nothing
             end
 
-            let cst = parse_and_pass("a == nothing")
+            for cst in parse_and_pass.(["a == nothing", "nothing == a"])
                 @test errorof(cst[1][2]) === StaticLint.NothingEquality
+            end
+            for cst in parse_and_pass.(["a != nothing", "nothing != a"])
+                @test errorof(cst[1][2]) === StaticLint.NothingNotEq
             end
 
             let cst = parse_and_pass("""
@@ -789,6 +803,18 @@ f(arg) = arg
             StaticLint.check_farg_unused(cst[1])
             @test cst[1].args[1].args[2].meta.error === nothing
         end
+        let cst = parse_and_pass("""
+            function f(x,y,z)
+                @. begin
+                    x = z
+                    y = z
+                end
+            end
+            """)
+           StaticLint.check_farg_unused(cst[1])
+           @test StaticLint.errorof(CSTParser.get_sig(cst[1])[3]) === nothing
+           @test StaticLint.errorof(CSTParser.get_sig(cst[1])[5]) === nothing
+       end
     end
 
     @testset "check redefinition of const" begin
@@ -1312,7 +1338,7 @@ f(arg) = arg
         let
             cst = parse_and_pass("""const x::T = x
             local const x = 1""")
-            @test errorof(cst.args[1]) === StaticLint.TypeDeclOnGlobalVariable
+            @test errorof(cst.args[1]) === (VERSION < v"1.8.0-DEV.1500" ? StaticLint.TypeDeclOnGlobalVariable : nothing)
             @test errorof(cst.args[2]) === StaticLint.UnsupportedConstLocalVariable
         end
     end
@@ -1784,4 +1810,177 @@ end
     cst2 = parse_and_pass("""@from "a.jl" using am3: MyStruct31""")
     @test CSTParser.headof(cst1.args[1].args[4]) === :using
     @test CSTParser.headof(cst2.args[1].args[4]) === :using
+end
+
+@testset "kwarg refs" begin
+    cst = parse_and_pass("""
+    function foo(aaa, bbb; ccc)
+        return aaa + bbb + ccc
+    end
+    """)
+    for (_, b) in cst.args[1].meta.scope.names
+        @test length(b.refs) == 2
+    end
+
+    cst = parse_and_pass("""
+    function foo(aaa, bbb::Foo; ccc::Bar)
+        return aaa + bbb + ccc
+    end
+    """)
+    for (_, b) in cst.args[1].meta.scope.names
+        @test length(b.refs) == 2
+    end
+
+    cst = parse_and_pass("""
+    function foo(aaa, bbb=1; ccc=2)
+        return aaa + bbb + ccc
+    end
+    """)
+    for (_, b) in cst.args[1].meta.scope.names
+        @test length(b.refs) == 2
+    end
+    cst = parse_and_pass("""
+    function foo(aaa, bbb::Foo=1; ccc::Bar=2)
+        return aaa + bbb + ccc
+    end
+    """)
+    for (_, b) in cst.args[1].meta.scope.names
+        @test length(b.refs) == 2
+    end
+end
+
+@testset "iteration over 1:length(...)" begin
+    cst = parse_and_pass("arr = []; [1 for _ in 1:length(arr)]")
+    @test isempty(StaticLint.collect_hints(cst, server))
+    cst = parse_and_pass("arr = []; [arr[i] for i in 1:length(arr)]")
+    @test length(StaticLint.collect_hints(cst, server)) == 2
+    cst = parse_and_pass("arr = []; [i for i in 1:length(arr)]")
+    @test length(StaticLint.collect_hints(cst, server)) == 0
+
+    cst = parse_and_pass("""
+    arr = []
+    for _ in 1:length(arr)
+    end
+    """)
+    @test isempty(StaticLint.collect_hints(cst, server))
+    cst = parse_and_pass("""
+    arr = []
+    for i in 1:length(arr)
+        arr[i]
+    end
+    """)
+    @test length(StaticLint.collect_hints(cst, server)) == 2
+    cst = parse_and_pass("""
+    arr = []
+    for i in 1:length(arr)
+        println(i)
+    end
+    """)
+    @test length(StaticLint.collect_hints(cst, server)) == 0
+
+    cst = parse_and_pass("""
+    arr = []
+    for _ in 1:length(arr), _ in 1:length(arr)
+    end
+    """)
+    @test isempty(StaticLint.collect_hints(cst, server))
+    cst = parse_and_pass("""
+    arr = []
+    for i in 1:length(arr), j in 1:length(arr)
+        arr[i] + arr[j]
+    end
+    """)
+    @test length(StaticLint.collect_hints(cst, server)) == 4
+    cst = parse_and_pass("""
+    arr = []
+    for i in 1:length(arr), j in 1:length(arr)
+        println(i + j)
+    end
+    """)
+    @test length(StaticLint.collect_hints(cst, server)) == 0
+
+    cst = parse_and_pass("""
+    function f(arr::Vector)
+        for i in 1:length(arr), j in 1:length(arr)
+            arr[i] + arr[j]
+        end
+    end
+    """)
+    @test length(StaticLint.collect_hints(cst, server)) == 0
+
+    cst = parse_and_pass("""
+    function f(arr::Array)
+        for i in 1:length(arr), j in 1:length(arr)
+            arr[i] + arr[j]
+        end
+    end
+    """)
+    @test length(StaticLint.collect_hints(cst, server)) == 0
+
+    cst = parse_and_pass("""
+    function f(arr::Matrix)
+        for i in 1:length(arr), j in 1:length(arr)
+            arr[i] + arr[j]
+        end
+    end
+    """)
+    @test length(StaticLint.collect_hints(cst, server)) == 0
+
+    cst = parse_and_pass("""
+    function f(arr::Array{T,N}) where T where N
+        for i in 1:length(arr), j in 1:length(arr)
+            arr[i] + arr[j]
+        end
+    end
+    """)
+    @test length(StaticLint.collect_hints(cst, server)) == 0
+
+    cst = parse_and_pass("""
+    function f(arr::AbstractArray)
+        for i in 1:length(arr), j in 1:length(arr)
+            arr[i] + arr[j]
+        end
+    end
+    """)
+    @test length(StaticLint.collect_hints(cst, server)) == 4
+
+    cst = parse_and_pass("""
+    function f(arr)
+        for i in 1:length(arr), j in 1:length(arr)
+            arr[i] + arr[j]
+        end
+    end
+    """)
+    @test length(StaticLint.collect_hints(cst, server)) == 4
+end
+
+@testset "assigned but not used with loops" begin
+    cst = parse_and_pass("""
+    function a!(v)
+        next = 0
+        for i in eachindex(v)
+            current = next
+            next = sin(current)
+            while true
+                current = next
+                next = sin(current)
+            end
+            v[i] = current
+        end
+    end
+    """)
+    @test isempty(StaticLint.collect_hints(cst, server))
+    cst = parse_and_pass("""
+    function f(v)
+        next = 0
+        for _ in v
+            foo = next
+            for _ in v
+                next = foo
+            end
+            foo = sin(next)
+        end
+    end
+    """)
+    @test isempty(StaticLint.collect_hints(cst, server))
 end
